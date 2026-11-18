@@ -1,15 +1,82 @@
-import joblib
 import pandas as pd
 import numpy as np
 import streamlit as st
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer, TransformedTargetRegressor
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.ensemble import HistGradientBoostingRegressor
 
 st.set_page_config(page_title="Medical Cargo Freight Cost Predictor", page_icon="🚢", layout="centered")
 
 @st.cache_resource
-def load_model():
-    return joblib.load("freight_cost_model.joblib")
+def build_and_train_model():
+    raw_df = pd.read_csv("SCMS_Delivery_History_Dataset.csv")
+    df = raw_df.copy()
 
-model = load_model()
+    # 1. Deterministic target & feature parsing
+    df["target_freight_usd"] = pd.to_numeric(df["Freight Cost (USD)"], errors="coerce")
+    df = df[df["target_freight_usd"].notna() & (df["target_freight_usd"] > 0)].copy()
+    df["Weight_kg"] = pd.to_numeric(df["Weight (Kilograms)"], errors="coerce")
+
+    cols_to_drop = [
+        "ID", "Project Code", "PQ #", "PO / SO #", "ASN/DN #",
+        "Item Description", "Molecule/Test Type",
+        "Delivered to Client Date", "Delivery Recorded Date",
+        "Line Item Insurance (USD)", "First Line Designation",
+        "Freight Cost (USD)", "Weight (Kilograms)",
+        "PQ First Sent to Client Date", "PO Sent to Vendor Date", "Scheduled Delivery Date",
+        "target_freight_usd"
+    ]
+    X = df.drop(columns=cols_to_drop)
+    y = df["target_freight_usd"]
+
+    y_buckets = pd.qcut(y, q=10, labels=False, duplicates="drop")
+    X_train, _, y_train, _ = train_test_split(
+        X, y, test_size=0.20, random_state=42, stratify=y_buckets
+    )
+
+    numeric_features = [
+        "Unit of Measure (Per Pack)", "Line Item Quantity",
+        "Line Item Value", "Pack Price", "Unit Price", "Weight_kg"
+    ]
+    categorical_features = [
+        "Country", "Managed By", "Fulfill Via", "Vendor INCO Term",
+        "Shipment Mode", "Product Group", "Sub Classification", "Vendor",
+        "Brand", "Dosage", "Dosage Form", "Manufacturing Site"
+    ]
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("num", Pipeline([
+                ("imputer", SimpleImputer(strategy="median", add_indicator=True)),
+                ("scaler", StandardScaler())
+            ]), numeric_features),
+            ("cat", Pipeline([
+                ("imputer", SimpleImputer(strategy="constant", fill_value="Missing")),
+                ("encoder", OneHotEncoder(handle_unknown="ignore", min_frequency=10, sparse_output=False))
+            ]), categorical_features)
+        ],
+        remainder="drop"
+    )
+
+    model = Pipeline(steps=[
+        ("preprocessor", preprocessor),
+        ("model", TransformedTargetRegressor(
+            regressor=HistGradientBoostingRegressor(
+                max_iter=160, learning_rate=0.05, max_leaf_nodes=45,
+                min_samples_leaf=15, l2_regularization=0.0, random_state=42
+            ),
+            func=np.log1p,
+            inverse_func=np.expm1
+        ))
+    ])
+
+    model.fit(X_train, y_train)
+    return model
+
+model = build_and_train_model()
 
 st.title("🚢 Medical Supply Chain Freight Cost Predictor")
 st.markdown(
@@ -32,7 +99,6 @@ with col2:
     line_qty = st.number_input("Line Item Quantity (Packs)", min_value=1, max_value=500000, value=500, step=50)
 
 if st.button("Predict Freight Cost", type="primary"):
-    # Construct single-row DataFrame matching X_train schema
     input_row = pd.DataFrame([{
         "Country": country,
         "Managed By": "PMO - US",
@@ -51,8 +117,7 @@ if st.button("Predict Freight Cost", type="primary"):
         "Pack Price": round(line_item_value / max(line_qty, 1), 2),
         "Unit Price": round((line_item_value / max(line_qty, 1)) / 30, 4),
         "Manufacturing Site": "Missing",
-        "Weight_kg": weight_kg,
-        "Planned_Lead_Time_Days": np.nan
+        "Weight_kg": weight_kg
     }])
 
     predicted_usd = model.predict(input_row)[0]
